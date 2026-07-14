@@ -6,6 +6,9 @@ import time
 import platform
 from pynput.keyboard import Key, Controller
 
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
 CAMERA_INDEX       = 0
 DEAD_ZONE_DEG      = 12
 RELEASE_ZONE_DEG   = 6
@@ -15,6 +18,7 @@ SHOW_ANGLE         = True
 MIN_DETECTION_CONF = 0.7
 MIN_TRACKING_CONF  = 0.5
 GRACE_FRAMES       = 8
+MODEL_PATH         = "hand_landmarker.task"
 
 CLR_WHEEL   = (80, 200, 255)
 CLR_LEFT    = (60, 120, 255)
@@ -25,9 +29,19 @@ CLR_ACCENT  = (0, 180, 255)
 CLR_HAND_L  = (255, 130, 60)
 CLR_HAND_R  = (60, 230, 130)
 
-keyboard   = Controller()
-mp_hands   = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+# Standard 21-point hand connection map (same topology the old
+# solutions.hands.HAND_CONNECTIONS used) - the Tasks API doesn't ship
+# a drawing_utils helper the way the old solutions API did, so we draw manually.
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+keyboard = Controller()
 
 
 class SteeringController:
@@ -93,6 +107,13 @@ class SteeringController:
             self._release(Key.right)
 
         return angle, direction, strength
+
+
+def draw_landmarks(frame, landmarks_px):
+    for (x1, y1) in landmarks_px:
+        cv2.circle(frame, (x1, y1), 2, (200, 200, 255), -1)
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, landmarks_px[a], landmarks_px[b], (80, 80, 100), 1)
 
 
 def draw_steering_wheel(frame, center, angle_deg, direction, strength):
@@ -186,7 +207,6 @@ def main():
         cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         print("[ERROR] Cannot open camera.")
-        print("  -> On macOS: System Settings > Privacy & Security > Camera")
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
@@ -196,22 +216,27 @@ def main():
 
     controller = SteeringController()
 
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        model_complexity=0,
-        min_detection_confidence=MIN_DETECTION_CONF,
+    BaseOptions           = mp_python.BaseOptions
+    HandLandmarker         = vision.HandLandmarker
+    HandLandmarkerOptions  = vision.HandLandmarkerOptions
+    VisionRunningMode      = vision.RunningMode
+
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=VisionRunningMode.VIDEO,   # synchronous, frame-by-frame - fits this loop directly
+        num_hands=2,
+        min_hand_detection_confidence=MIN_DETECTION_CONF,
+        min_hand_presence_confidence=MIN_DETECTION_CONF,
         min_tracking_confidence=MIN_TRACKING_CONF,
     )
-
-    conn_style     = mp_drawing.DrawingSpec(color=(80, 80, 100), thickness=1)
-    landmark_style = mp_drawing.DrawingSpec(color=(200, 200, 255), thickness=1, circle_radius=2)
+    landmarker = HandLandmarker.create_from_options(options)
 
     prev_time    = time.time()
     angle        = 0.0
     direction    = "STRAIGHT"
     strength     = 0.0
     lost_frames  = 0
+    start_time   = time.time()
 
     print("=" * 50)
     print("  Virtual Steering Wheel  |  Press Q to quit")
@@ -230,23 +255,23 @@ def main():
             h, w = frame.shape[:2]
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = hands.process(rgb)
-            rgb.flags.writeable = True
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int((time.time() - start_time) * 1000)
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             both_visible = False
 
-            if results.multi_hand_landmarks and results.multi_handedness:
+            if result.hand_landmarks and result.handedness:
                 hand_data = {}
 
-                for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                    label = handedness.classification[0].label
+                for hand_landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+                    label = handedness[0].category_name  # "Left" or "Right"
 
-                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS, landmark_style, conn_style)
+                    landmarks_px = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+                    draw_landmarks(frame, landmarks_px)
 
-                    wrist = hand_landmarks.landmark[0]
-                    wx    = int(wrist.x * w)
-                    wy    = int(wrist.y * h)
+                    wrist = hand_landmarks[0]
+                    wx, wy = landmarks_px[0]
                     hand_data[label] = (wrist.x, wrist.y, wx, wy)
 
                 if "Left" in hand_data and "Right" in hand_data:
@@ -281,7 +306,7 @@ def main():
 
     finally:
         controller.release_all()
-        hands.close()
+        landmarker.close()
         cap.release()
         cv2.destroyAllWindows()
         print("\n[INFO] Stopped. All keys released.")
